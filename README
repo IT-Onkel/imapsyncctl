@@ -1,0 +1,9 @@
+# imapsyncctl
+
+CLI-Tool zur IMAP-Postfach-Synchronisation (imapsync) mit Profilen, Logs, Retries.
+
+## Install
+```bash
+git clone <repo>
+cd imapsyncctl
+sudo ./scripts/install.sh

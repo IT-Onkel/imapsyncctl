@@ -1,0 +1,1152 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ============================================================
+# imapsyncctl (for imapsync 2.229)
+#
+# Layout (installed):
+#   /etc/imapsyncctl/config.conf
+#   /etc/imapsyncctl/profiles/<name>/profile.conf
+#   /etc/imapsyncctl/profiles/<name>/options.conf   (optional overrides)
+#
+#   /var/lib/imapsyncctl/secrets/<name>/target.pass
+#   /var/lib/imapsyncctl/secrets/<name>/sources/<sid>.pass
+#   /var/lib/imapsyncctl/state/<name>.lock
+#
+#   /var/log/imapsyncctl/runs/<name>/<timestamp>__<src>__TO__<dst>/
+#       imapsync.log, screen.log, exitcode
+# ============================================================
+
+ETC_DIR="${ETC_DIR:-/etc/imapsyncctl}"
+LIB_DIR="${LIB_DIR:-/var/lib/imapsyncctl}"
+LOG_DIR="${LOG_DIR:-/var/log/imapsyncctl}"
+
+GLOBAL_CFG="${GLOBAL_CFG:-$ETC_DIR/config.conf}"
+PROFILES_ROOT="${PROFILES_ROOT:-$ETC_DIR/profiles}"
+SECRETS_ROOT="${SECRETS_ROOT:-$LIB_DIR/secrets}"
+STATE_DIR="${STATE_DIR:-$LIB_DIR/state}"
+RUNS_DIR="${RUNS_DIR:-$LOG_DIR/runs}"
+
+CMD_NAME="${CMD_NAME:-imapsyncctl}"
+
+die() { echo "FEHLER: $*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "'$1' ist nicht installiert oder nicht im PATH."; }
+
+usage() {
+  cat <<EOF
+Usage:
+  $CMD_NAME new                      Neues Profil anlegen (1..n Quellen)
+  $CMD_NAME addsource <profile>      Zusätzliche Quelle zu Profil hinzufügen
+  $CMD_NAME reconfigure <profile>    Wizard: Profil neu durchgehen + options.conf Wizard
+  $CMD_NAME run <profile>            Profil ausführen (alle Quellen nacheinander; screen wird angezeigt)
+  $CMD_NAME status                   Laufende imapsyncctl screen sessions anzeigen
+  $CMD_NAME list                     Profile auflisten
+  $CMD_NAME show <profile>           Profil anzeigen (ohne Passwörter)
+  $CMD_NAME edit <profile>           profile.conf in \$EDITOR öffnen
+  $CMD_NAME delete <profile>         Profil löschen (profiles+secrets; Logs optional)
+  $CMD_NAME cleanup                  Unvollständige Profile finden & löschen
+
+Config:
+  Global:  $GLOBAL_CFG
+  Profile: $PROFILES_ROOT/<name>/profile.conf
+  Options: $PROFILES_ROOT/<name>/options.conf (optional overrides)
+
+Host autodetect:
+  - Host Eingabe ist optional. ENTER => Auto-Erkennung:
+    1) MX der Maildomain (nur wenn 993/143 erreichbar)
+    2) imap.<domain>, mail.<domain>, imap.mail.<domain> (in Reihenfolge, nur wenn 993/143 erreichbar)
+    3) sonst manuelle Eingabe (erneute Abfrage)
+
+Notes:
+  - Wiederholbare Optionen (z.B. folder/exclude/include/regextrans2/f1f2/skipmess/...)
+    können in config.conf/options.conf mehrfach als key=value stehen.
+EOF
+}
+
+# ---------------- Paths ----------------
+profile_dir()      { echo "$PROFILES_ROOT/$1"; }
+profile_file()     { echo "$(profile_dir "$1")/profile.conf"; }
+options_file()     { echo "$(profile_dir "$1")/options.conf"; }
+
+secret_dir()       { echo "$SECRETS_ROOT/$1"; }
+sources_secret_dir(){ echo "$(secret_dir "$1")/sources"; }
+target_pass_path() { echo "$(secret_dir "$1")/target.pass"; }
+source_pass_path() { echo "$(sources_secret_dir "$1")/$2.pass"; }
+
+lock_file()        { echo "$STATE_DIR/$1.lock"; }
+
+sanitize() {
+  local s="$1"
+  s="${s//@/_at_}"
+  s="${s//[^A-Za-z0-9._-]/_}"
+  echo "$s"
+}
+
+prompt() {
+  local var="$1" text="$2" default="${3:-}" input
+  if [[ -n "$default" ]]; then
+    read -r -p "${text} [${default}]: " input
+    input="${input:-$default}"
+  else
+    read -r -p "${text}: " input
+  fi
+  printf -v "$var" '%s' "$input"
+}
+
+prompt_optional() {
+  local var="$1" text="$2" default="${3:-}" input
+  if [[ -n "$default" ]]; then
+    read -r -p "${text} [${default}]: " input
+    input="${input:-$default}"
+  else
+    read -r -p "${text}: " input
+  fi
+  printf -v "$var" '%s' "$input"
+}
+
+prompt_int() {
+  local var="$1" text="$2" default="${3:-1}" input
+  read -r -p "${text} [${default}]: " input
+  input="${input:-$default}"
+  [[ "$input" =~ ^[0-9]+$ ]] || die "Bitte eine Zahl eingeben."
+  printf -v "$var" '%s' "$input"
+}
+
+prompt_flo() {
+  local var="$1" text="$2" default="${3:-}" input
+  read -r -p "${text} [${default}]: " input
+  input="${input:-$default}"
+  [[ -z "$input" || "$input" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "Bitte Zahl eingeben (int oder flo)."
+  printf -v "$var" '%s' "$input"
+}
+
+yesno() {
+  local text="$1" default="${2:-n}" ans hint
+  hint="[y/N]"; [[ "$default" =~ ^[Yy]$ ]] && hint="[Y/n]"
+  read -r -p "${text} ${hint}: " ans
+  ans="${ans:-$default}"
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+prompt_secret_to_file() {
+  local filepath="$1" text="$2" tmp pw
+  tmp="$(mktemp)"
+  chmod 600 "$tmp"
+  read -r -s -p "${text}: " pw
+  echo
+  printf '%s' "$pw" > "$tmp"
+  unset pw
+  mkdir -p "$(dirname "$filepath")"
+  mv "$tmp" "$filepath"
+  chmod 600 "$filepath"
+}
+
+ensure_dirs() {
+  mkdir -p "$ETC_DIR" "$PROFILES_ROOT" "$LIB_DIR" "$SECRETS_ROOT" "$STATE_DIR" "$LOG_DIR" "$RUNS_DIR"
+  chmod 700 "$LIB_DIR" "$SECRETS_ROOT" "$STATE_DIR" 2>/dev/null || true
+  chmod 755 "$ETC_DIR" "$PROFILES_ROOT" "$LOG_DIR" "$RUNS_DIR" 2>/dev/null || true
+}
+
+# ============================================================
+# DNS + Port checking for IMAP host autodetect
+# ============================================================
+
+extract_domain_from_email() {
+  local email="$1"
+  if [[ "$email" == *"@"* ]]; then
+    echo "${email#*@}"
+  else
+    echo ""
+  fi
+}
+
+mx_lookup() {
+  local domain="$1" mx=""
+  if command -v dig >/dev/null 2>&1; then
+    mx="$(dig +short MX "$domain" 2>/dev/null | sort -n | head -n 1 | awk '{print $2}' | sed 's/\.$//')"
+  elif command -v host >/dev/null 2>&1; then
+    mx="$(host -t mx "$domain" 2>/dev/null | awk '{print $NF}' | sed 's/\.$//' | head -n 1)"
+  elif command -v nslookup >/dev/null 2>&1; then
+    mx="$(nslookup -type=mx "$domain" 2>/dev/null | awk '/mail exchanger/ {print $NF}' | sed 's/\.$//' | head -n 1)"
+  else
+    echo ""
+    return 0
+  fi
+  echo "$mx"
+}
+
+port_open() {
+  local host="$1" port="$2"
+
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w 3 "$host" "$port" >/dev/null 2>&1 && return 0 || return 1
+  fi
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" >/dev/null 2>&1 && return 0 || return 1
+  fi
+
+  if command -v openssl >/dev/null 2>&1; then
+    openssl s_client -connect "${host}:${port}" -servername "$host" -brief </dev/null >/dev/null 2>&1 && return 0 || return 1
+  fi
+
+  return 1
+}
+
+imap_port_reachable() {
+  local host="$1"
+  port_open "$host" 993 && return 0
+  port_open "$host" 143 && return 0
+  return 1
+}
+
+resolve_imap_host_for_email() {
+  local email="$1"
+  local domain; domain="$(extract_domain_from_email "$email")"
+  [[ -n "$domain" ]] || { echo ""; return 0; }
+
+  local mx; mx="$(mx_lookup "$domain")"
+  if [[ -n "$mx" ]]; then
+    if imap_port_reachable "$mx"; then
+      echo "$mx"
+      return 0
+    fi
+  fi
+
+  local h
+  for h in "imap.${domain}" "mail.${domain}" "imap.mail.${domain}"; do
+    if imap_port_reachable "$h"; then
+      echo "$h"
+      return 0
+    fi
+  done
+
+  echo ""
+}
+
+prompt_host_or_autodetect() {
+  # args: outvar, label, email_for_domain, default_value(optional)
+  local outvar="$1" label="$2" email="$3" def="${4:-}"
+  local host
+
+  while true; do
+    if [[ -n "$def" ]]; then
+      prompt_optional host "${label} (ENTER => Auto: MX/imap./mail. + Portcheck 993/143)" "$def"
+    else
+      prompt_optional host "${label} (ENTER => Auto: MX/imap./mail. + Portcheck 993/143)"
+    fi
+
+    if [[ -n "$host" ]]; then
+      printf -v "$outvar" '%s' "$host"
+      return 0
+    fi
+
+    host="$(resolve_imap_host_for_email "$email")"
+    if [[ -n "$host" ]]; then
+      echo "→ Auto-Host ermittelt & erreichbar (993/143): $host"
+      printf -v "$outvar" '%s' "$host"
+      return 0
+    fi
+
+    echo "⚠️  Kein geeigneter IMAP-Host gefunden (MX/imap./mail. nicht erreichbar). Bitte Host manuell eingeben."
+    def=""
+  done
+}
+
+# ============================================================
+# Config loader (key=value) with multi-keys support
+# ============================================================
+
+declare -A CFG=()
+MULTI_KEYS=(
+  folder folderrec folderfirst folderlast
+  include exclude
+  f1f2 regextrans2
+  skipmess pipemess regexmess regexflag useheader
+)
+
+is_multi_key() {
+  local k="$1"
+  for m in "${MULTI_KEYS[@]}"; do [[ "$m" == "$k" ]] && return 0; done
+  return 1
+}
+
+append_multi() {
+  local k="$1" v="$2" arr="CFGM_${k}"
+  declare -g -a "$arr" 2>/dev/null || true
+  eval "$arr+=(\"\$v\")"
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  echo "$s"
+}
+
+load_kv_file_into() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+    [[ "${line:0:1}" == "#" ]] && continue
+    [[ "$line" != *"="* ]] && continue
+    key="$(trim "${line%%=*}")"
+    val="$(trim "${line#*=}")"
+    [[ -z "$key" ]] && continue
+    if is_multi_key "$key"; then
+      [[ -n "$val" ]] && append_multi "$key" "$val"
+    else
+      CFG["$key"]="$val"
+    fi
+  done < "$file"
+}
+
+cfg_get() {
+  local key="$1" default="${2:-}"
+  if [[ -n "${CFG[$key]+x}" ]]; then echo "${CFG[$key]}"; else echo "$default"; fi
+}
+cfg_bool() { local v; v="$(cfg_get "$1" "${2:-0}")"; [[ "$v" == "1" ]]; }
+
+# ============================================================
+# Profile loader
+# ============================================================
+
+load_profile() {
+  local name="$1" pfile; pfile="$(profile_file "$name")"
+  [[ -f "$pfile" ]] || die "Profil nicht gefunden: $name ($pfile)"
+  # shellcheck disable=SC1090
+  source "$pfile"
+  [[ -n "${HOST2:-}" && -n "${USER2:-}" ]] || die "Profil $name: HOST2/USER2 fehlen."
+
+  local sources_len=0
+  if declare -p SOURCES >/dev/null 2>&1; then sources_len="${#SOURCES[@]}"; else sources_len=0; fi
+
+  if [[ "$sources_len" -eq 0 ]]; then
+    if [[ -n "${HOST1:-}" && -n "${USER1:-}" ]]; then
+      SOURCES=("src1|${HOST1}|${USER1}")
+    else
+      die "Profil $name: Keine Quellen definiert (SOURCES oder HOST1/USER1)."
+    fi
+  fi
+}
+
+write_profile_file_exact() {
+  local name="$1" host2="$2" user2="$3"; shift 3
+  local -a sources_new=( "$@" )
+  local dir; dir="$(profile_dir "$name")"
+  mkdir -p "$dir"
+  {
+    echo "# imapsyncctl profile: ${name}"
+    echo "HOST2=\"${host2}\""
+    echo "USER2=\"${user2}\""
+    echo
+    echo "SOURCES=("
+    for s in "${sources_new[@]}"; do echo "  \"${s}\""; done
+    echo ")"
+  } >"$(profile_file "$name")"
+  chmod 600 "$(profile_file "$name")" 2>/dev/null || true
+}
+
+next_source_id() {
+  local name="$1" max=0
+  if [[ -d "$(sources_secret_dir "$name")" ]]; then
+    while IFS= read -r f; do
+      local base; base="$(basename "$f" .pass)"
+      if [[ "$base" =~ ^src([0-9]+)$ ]]; then
+        local n="${BASH_REMATCH[1]}"; (( n > max )) && max="$n"
+      fi
+    done < <(find "$(sources_secret_dir "$name")" -maxdepth 1 -type f -name "src*.pass" 2>/dev/null || true)
+  fi
+  echo "src$((max+1))"
+}
+
+# ============================================================
+# Build imapsync args from config (global + per-profile override)
+# ============================================================
+
+IMAPHELP_CACHE=""
+IMAPSYNC_ARGS=()
+
+imapsync_supports() {
+  local opt="$1"
+  if [[ -z "$IMAPHELP_CACHE" ]]; then IMAPHELP_CACHE="$(imapsync --help 2>/dev/null || true)"; fi
+  grep -q -- "$opt" <<<"$IMAPHELP_CACHE"
+}
+add_flag() { local opt="$1"; imapsync_supports "$opt" && IMAPSYNC_ARGS+=("$opt") || echo "⚠️  imapsync kennt $opt nicht (skip)" >&2; }
+add_kv_opt(){ local opt="$1" val="$2"; [[ -z "$val" ]] && return 0; imapsync_supports "$opt" && IMAPSYNC_ARGS+=("$opt" "$val") || echo "⚠️  imapsync kennt $opt nicht (skip)" >&2; }
+
+append_extra_args() {
+  local s="$1"; [[ -z "$s" ]] && return 0
+  local -a parts=()
+  # shellcheck disable=SC2207
+  parts=($(bash -lc "printf '%s\n' $s" 2>/dev/null || true))
+  for p in "${parts[@]}"; do IMAPSYNC_ARGS+=("$p"); done
+}
+
+build_imapsync_args_from_cfg() {
+  IMAPSYNC_ARGS=()
+
+  if cfg_bool ssl1 1; then add_flag --ssl1; else add_flag --nossl1; fi
+  if cfg_bool ssl2 1; then add_flag --ssl2; else add_flag --nossl2; fi
+  if cfg_bool tls1 0; then add_flag --tls1; else add_flag --notls1; fi
+  if cfg_bool tls2 0; then add_flag --tls2; else add_flag --notls2; fi
+  add_kv_opt --sslargs1 "$(cfg_get sslargs1 "")"
+  add_kv_opt --sslargs2 "$(cfg_get sslargs2 "")"
+  add_kv_opt --debugssl  "$(cfg_get debugssl  "")"
+
+  cfg_bool dry 0 && add_flag --dry
+  cfg_bool usecache 0 && add_flag --usecache
+  cfg_bool nousecache 0 && add_flag --nousecache
+  cfg_bool useuid 0 && add_flag --useuid
+  cfg_bool automap 0 && add_flag --automap
+
+  if cfg_bool syncinternaldates 1; then add_flag --syncinternaldates; else cfg_bool idatefromheader 0 && add_flag --idatefromheader; fi
+
+  cfg_bool delete2 0 && add_flag --delete2
+  cfg_bool delete2duplicates 0 && add_flag --delete2duplicates
+  cfg_bool delete2folders 0 && add_flag --delete2folders
+  add_kv_opt --delete2foldersonly   "$(cfg_get delete2foldersonly "")"
+  add_kv_opt --delete2foldersbutnot "$(cfg_get delete2foldersbutnot "")"
+
+  cfg_bool delete1 0 && add_flag --delete1
+  cfg_bool delete1emptyfolders 0 && add_flag --delete1emptyfolders
+  cfg_bool expunge1 0 && add_flag --expunge1
+  cfg_bool noexpunge1 0 && add_flag --noexpunge1
+  cfg_bool noexpunge2 0 && add_flag --noexpunge2
+  cfg_bool nouidexpunge2 0 && add_flag --nouidexpunge2
+
+  local arr k v
+  for k in folder folderrec folderfirst folderlast include exclude f1f2 regextrans2; do
+    arr="CFGM_${k}"
+    if declare -p "$arr" >/dev/null 2>&1; then
+      eval "for v in \"\${$arr[@]}\"; do IMAPSYNC_ARGS+=(\"--$k\" \"\$v\"); done"
+    fi
+  done
+
+  add_kv_opt --subfolder1 "$(cfg_get subfolder1 "")"
+  add_kv_opt --subfolder2 "$(cfg_get subfolder2 "")"
+  cfg_bool nomixfolders 0 && add_flag --nomixfolders
+  cfg_bool skipemptyfolders 0 && add_flag --skipemptyfolders
+  cfg_bool subscribed 0 && add_flag --subscribed
+  cfg_bool subscribeall 0 && add_flag --subscribeall
+  add_kv_opt --prefix1 "$(cfg_get prefix1 "")"
+  add_kv_opt --prefix2 "$(cfg_get prefix2 "")"
+  add_kv_opt --sep1    "$(cfg_get sep1 "")"
+  add_kv_opt --sep2    "$(cfg_get sep2 "")"
+
+  cfg_bool nofoldersizes 0 && add_flag --nofoldersizes
+  cfg_bool nofoldersizesatend 0 && add_flag --nofoldersizesatend
+  cfg_bool justfoldersizes 0 && add_flag --justfoldersizes
+
+  add_kv_opt --maxsize "$(cfg_get maxsize "")"
+  add_kv_opt --minsize "$(cfg_get minsize "")"
+  add_kv_opt --maxage  "$(cfg_get maxage  "")"
+  add_kv_opt --minage  "$(cfg_get minage  "")"
+  add_kv_opt --search  "$(cfg_get search  "")"
+  add_kv_opt --search1 "$(cfg_get search1 "")"
+  add_kv_opt --search2 "$(cfg_get search2 "")"
+  add_kv_opt --maxlinelength "$(cfg_get maxlinelength "")"
+
+  arr="CFGM_useheader"
+  if declare -p "$arr" >/dev/null 2>&1; then
+    eval "for v in \"\${$arr[@]}\"; do IMAPSYNC_ARGS+=(\"--useheader\" \"\$v\"); done"
+  else
+    local uh; uh="$(cfg_get useheader "")"
+    [[ -n "$uh" ]] && add_kv_opt --useheader "$uh"
+  fi
+  cfg_bool syncduplicates 0 && add_flag --syncduplicates
+
+  add_kv_opt --tmpdir "$(cfg_get tmpdir "")"
+  add_kv_opt --pidfile "$(cfg_get pidfile "")"
+  cfg_bool pidfilelocking 0 && add_flag --pidfilelocking
+  cfg_bool abort 0 && add_flag --abort
+
+  add_kv_opt --timeout1 "$(cfg_get timeout1 "")"
+  add_kv_opt --timeout2 "$(cfg_get timeout2 "")"
+  add_kv_opt --maxmessagespersecond "$(cfg_get maxmessagespersecond "")"
+  add_kv_opt --maxbytespersecond "$(cfg_get maxbytespersecond "")"
+  add_kv_opt --maxbytesafter "$(cfg_get maxbytesafter "")"
+  add_kv_opt --maxsleep "$(cfg_get maxsleep "")"
+  add_kv_opt --exitwhenover "$(cfg_get exitwhenover "")"
+
+  cfg_bool justfolders 0 && add_flag --justfolders
+  cfg_bool justlogin 0 && add_flag --justlogin
+
+  add_kv_opt --authmech1 "$(cfg_get authmech1 "")"
+  add_kv_opt --authmech2 "$(cfg_get authmech2 "")"
+  add_kv_opt --authuser1 "$(cfg_get authuser1 "")"
+  add_kv_opt --authuser2 "$(cfg_get authuser2 "")"
+  cfg_bool proxyauth1 0 && add_flag --proxyauth1
+  cfg_bool proxyauth2 0 && add_flag --proxyauth2
+  cfg_bool authmd51 0 && add_flag --authmd51
+  cfg_bool authmd52 0 && add_flag --authmd52
+  add_kv_opt --domain1 "$(cfg_get domain1 "")"
+  add_kv_opt --domain2 "$(cfg_get domain2 "")"
+  add_kv_opt --oauthaccesstoken1 "$(cfg_get oauthaccesstoken1 "")"
+  add_kv_opt --oauthaccesstoken2 "$(cfg_get oauthaccesstoken2 "")"
+  add_kv_opt --oauthdirect1 "$(cfg_get oauthdirect1 "")"
+  add_kv_opt --oauthdirect2 "$(cfg_get oauthdirect2 "")"
+
+  cfg_bool noid 0 && add_flag --noid
+  cfg_bool noreleasecheck 1 && add_flag --noreleasecheck
+  cfg_bool debug 0 && add_flag --debug
+  cfg_bool debugimap1 0 && add_flag --debugimap1
+  cfg_bool debugimap2 0 && add_flag --debugimap2
+  cfg_bool debugimap 0 && add_flag --debugimap
+  add_kv_opt --errorsmax "$(cfg_get errorsmax "")"
+  cfg_bool showpasswords 0 && add_flag --showpasswords
+
+  for k in skipmess pipemess regexmess regexflag; do
+    arr="CFGM_${k}"
+    if declare -p "$arr" >/dev/null 2>&1; then
+      eval "for v in \"\${$arr[@]}\"; do IMAPSYNC_ARGS+=(\"--$k\" \"\$v\"); done"
+    fi
+  done
+
+  cfg_bool gmail1 0 && add_flag --gmail1
+  cfg_bool gmail2 0 && add_flag --gmail2
+  cfg_bool office1 0 && add_flag --office1
+  cfg_bool office2 0 && add_flag --office2
+  cfg_bool exchange1 0 && add_flag --exchange1
+  cfg_bool exchange2 0 && add_flag --exchange2
+  cfg_bool domino1 0 && add_flag --domino1
+  cfg_bool domino2 0 && add_flag --domino2
+
+  append_extra_args "$(cfg_get extra_args "")"
+}
+
+load_config_for_profile() {
+  CFG=()
+  for k in "${MULTI_KEYS[@]}"; do
+    local arr="CFGM_${k}"
+    if declare -p "$arr" >/dev/null 2>&1; then unset "$arr" 2>/dev/null || true; fi
+  done
+  load_kv_file_into "$GLOBAL_CFG"
+  load_kv_file_into "$(options_file "$1")"
+}
+
+# ============================================================
+# options.conf wizard
+# ============================================================
+
+write_options_file() {
+  local name="$1"
+  local of; of="$(options_file "$name")"
+  mkdir -p "$(profile_dir "$name")"
+  {
+    echo "# imapsyncctl per-profile overrides (key=value)"
+    echo "# generated by wizard on $(date)"
+    echo
+    printf "ssl1=%s\n" "$(cfg_get ssl1 1)"
+    printf "ssl2=%s\n" "$(cfg_get ssl2 1)"
+    printf "tls1=%s\n" "$(cfg_get tls1 0)"
+    printf "tls2=%s\n" "$(cfg_get tls2 0)"
+    printf "usecache=%s\n" "$(cfg_get usecache 0)"
+    printf "nousecache=%s\n" "$(cfg_get nousecache 0)"
+    printf "useuid=%s\n" "$(cfg_get useuid 0)"
+    printf "automap=%s\n" "$(cfg_get automap 0)"
+    printf "syncinternaldates=%s\n" "$(cfg_get syncinternaldates 1)"
+    printf "idatefromheader=%s\n" "$(cfg_get idatefromheader 0)"
+    printf "delete2=%s\n" "$(cfg_get delete2 0)"
+    printf "delete2duplicates=%s\n" "$(cfg_get delete2duplicates 0)"
+    printf "delete2folders=%s\n" "$(cfg_get delete2folders 0)"
+    printf "delete1=%s\n" "$(cfg_get delete1 0)"
+    printf "delete1emptyfolders=%s\n" "$(cfg_get delete1emptyfolders 0)"
+    printf "expunge1=%s\n" "$(cfg_get expunge1 0)"
+    printf "noexpunge1=%s\n" "$(cfg_get noexpunge1 0)"
+    printf "noexpunge2=%s\n" "$(cfg_get noexpunge2 0)"
+    printf "nouidexpunge2=%s\n" "$(cfg_get nouidexpunge2 0)"
+    printf "nofoldersizes=%s\n" "$(cfg_get nofoldersizes 0)"
+    printf "nofoldersizesatend=%s\n" "$(cfg_get nofoldersizesatend 0)"
+    printf "maxsize=%s\n" "$(cfg_get maxsize "")"
+    printf "minsize=%s\n" "$(cfg_get minsize "")"
+    printf "maxage=%s\n" "$(cfg_get maxage "")"
+    printf "minage=%s\n" "$(cfg_get minage "")"
+    printf "search=%s\n" "$(cfg_get search "")"
+    printf "errorsmax=%s\n" "$(cfg_get errorsmax "")"
+    printf "timeout1=%s\n" "$(cfg_get timeout1 "")"
+    printf "timeout2=%s\n" "$(cfg_get timeout2 "")"
+    printf "maxmessagespersecond=%s\n" "$(cfg_get maxmessagespersecond "")"
+    printf "maxbytespersecond=%s\n" "$(cfg_get maxbytespersecond "")"
+    printf "retries=%s\n" "$(cfg_get retries 3)"
+    printf "retry_delay=%s\n" "$(cfg_get retry_delay 10)"
+    printf "debug=%s\n" "$(cfg_get debug 0)"
+    printf "debugimap1=%s\n" "$(cfg_get debugimap1 0)"
+    printf "debugimap2=%s\n" "$(cfg_get debugimap2 0)"
+    printf "extra_args=%s\n" "$(cfg_get extra_args "")"
+  } > "$of"
+  chmod 600 "$of" 2>/dev/null || true
+  echo "✅ options.conf geschrieben: $of"
+}
+
+options_wizard() {
+  local name="$1"
+  echo
+  echo "=== options.conf Wizard: $name ==="
+  echo "Defaults kommen aus global + (falls vorhanden) options.conf."
+  echo
+
+  local v
+  prompt v "ssl1 (1/0)" "$(cfg_get ssl1 1)"; CFG[ssl1]="$v"
+  prompt v "ssl2 (1/0)" "$(cfg_get ssl2 1)"; CFG[ssl2]="$v"
+  prompt v "tls1 (1/0)" "$(cfg_get tls1 0)"; CFG[tls1]="$v"
+  prompt v "tls2 (1/0)" "$(cfg_get tls2 0)"; CFG[tls2]="$v"
+
+  prompt v "usecache (1/0)" "$(cfg_get usecache 0)"; CFG[usecache]="$v"
+  prompt v "nousecache (1/0)" "$(cfg_get nousecache 0)"; CFG[nousecache]="$v"
+  prompt v "useuid (1/0)" "$(cfg_get useuid 0)"; CFG[useuid]="$v"
+  prompt v "automap (1/0)" "$(cfg_get automap 0)"; CFG[automap]="$v"
+
+  prompt v "syncinternaldates (1/0)" "$(cfg_get syncinternaldates 1)"; CFG[syncinternaldates]="$v"
+  prompt v "idatefromheader (1/0)" "$(cfg_get idatefromheader 0)"; CFG[idatefromheader]="$v"
+
+  echo
+  echo "⚠️  delete2 löscht im ZIEL, was in QUELLE nicht existiert."
+  prompt v "delete2 (1/0)" "$(cfg_get delete2 0)"; CFG[delete2]="$v"
+  prompt v "delete2duplicates (1/0)" "$(cfg_get delete2duplicates 0)"; CFG[delete2duplicates]="$v"
+  prompt v "delete2folders (1/0)" "$(cfg_get delete2folders 0)"; CFG[delete2folders]="$v"
+
+  echo
+  echo "⚠️  delete1 löscht QUELLE nach erfolgreichem Transfer."
+  prompt v "delete1 (1/0)" "$(cfg_get delete1 0)"; CFG[delete1]="$v"
+  prompt v "delete1emptyfolders (1/0)" "$(cfg_get delete1emptyfolders 0)"; CFG[delete1emptyfolders]="$v"
+
+  prompt v "expunge1 (1/0)" "$(cfg_get expunge1 0)"; CFG[expunge1]="$v"
+  prompt v "noexpunge1 (1/0)" "$(cfg_get noexpunge1 0)"; CFG[noexpunge1]="$v"
+  prompt v "noexpunge2 (1/0)" "$(cfg_get noexpunge2 0)"; CFG[noexpunge2]="$v"
+  prompt v "nouidexpunge2 (1/0)" "$(cfg_get nouidexpunge2 0)"; CFG[nouidexpunge2]="$v"
+
+  prompt v "nofoldersizes (1/0)" "$(cfg_get nofoldersizes 0)"; CFG[nofoldersizes]="$v"
+  prompt v "nofoldersizesatend (1/0)" "$(cfg_get nofoldersizesatend 0)"; CFG[nofoldersizesatend]="$v"
+
+  prompt v "maxsize (leer oder int bytes)" "$(cfg_get maxsize "")"; CFG[maxsize]="$v"
+  prompt v "minsize (leer oder int bytes)" "$(cfg_get minsize "")"; CFG[minsize]="$v"
+  prompt v "maxage (leer oder int Tage)" "$(cfg_get maxage "")"; CFG[maxage]="$v"
+  prompt v "minage (leer oder int Tage)" "$(cfg_get minage "")"; CFG[minage]="$v"
+  prompt v "search (leer oder IMAP SEARCH string)" "$(cfg_get search "")"; CFG[search]="$v"
+
+  prompt v "errorsmax (leer oder int)" "$(cfg_get errorsmax "")"; CFG[errorsmax]="$v"
+  prompt_flo v "timeout1 (leer oder Sekunden flo)" "$(cfg_get timeout1 "")"; CFG[timeout1]="$v"
+  prompt_flo v "timeout2 (leer oder Sekunden flo)" "$(cfg_get timeout2 "")"; CFG[timeout2]="$v"
+  prompt_flo v "maxmessagespersecond (leer oder flo)" "$(cfg_get maxmessagespersecond "")"; CFG[maxmessagespersecond]="$v"
+  prompt v "maxbytespersecond (leer oder int)" "$(cfg_get maxbytespersecond "")"; CFG[maxbytespersecond]="$v"
+
+  prompt_int v "imapsyncctl retries pro Quelle" "$(cfg_get retries 3)"; CFG[retries]="$v"
+  prompt_int v "imapsyncctl retry_delay Basis (Sekunden)" "$(cfg_get retry_delay 10)"; CFG[retry_delay]="$v"
+
+  prompt v "debug (1/0)" "$(cfg_get debug 0)"; CFG[debug]="$v"
+  prompt v "debugimap1 (1/0)" "$(cfg_get debugimap1 0)"; CFG[debugimap1]="$v"
+  prompt v "debugimap2 (1/0)" "$(cfg_get debugimap2 0)"; CFG[debugimap2]="$v"
+
+  prompt v "extra_args (frei, leer ok)" "$(cfg_get extra_args "")"; CFG[extra_args]="$v"
+
+  echo
+  if yesno "options.conf speichern?" "y"; then
+    write_options_file "$name"
+  else
+    echo "Abgebrochen (options.conf nicht geändert)."
+  fi
+}
+
+# ============================================================
+# Commands
+# ============================================================
+
+cmd_list() {
+  ensure_dirs
+  for d in "$PROFILES_ROOT"/*; do [[ -d "$d" && -f "$d/profile.conf" ]] && basename "$d"; done
+}
+
+cmd_show() {
+  ensure_dirs
+  local name="${1:-}"; [[ -n "$name" ]] || die "Name fehlt."
+  [[ -f "$(profile_file "$name")" ]] || die "Profil nicht gefunden: $name"
+
+  echo "Profil: $name"
+  sed 's/^/  /' "$(profile_file "$name")"
+  echo
+  if [[ -f "$(options_file "$name")" ]]; then
+    echo "Options (Override):"
+    sed 's/^/  /' "$(options_file "$name")"
+    echo
+  fi
+  echo "Secrets (Passwörter werden NICHT angezeigt):"
+  echo "  Ziel:    $(target_pass_path "$name") $( [[ -f "$(target_pass_path "$name")" ]] && echo "(OK)" || echo "(FEHLT)" )"
+  echo "  Quellen: $(sources_secret_dir "$name")/"
+  ls -1 "$(sources_secret_dir "$name")"/*.pass 2>/dev/null | sed 's#^#    - #' || true
+}
+
+cmd_edit() {
+  ensure_dirs
+  local name="${1:-}"; [[ -n "$name" ]] || die "Name fehlt."
+  local pfile; pfile="$(profile_file "$name")"
+  [[ -f "$pfile" ]] || die "Profil nicht gefunden: $name"
+  "${EDITOR:-nano}" "$pfile"
+}
+
+cmd_status() {
+  need_cmd screen
+  local out; out="$(screen -list 2>/dev/null || true)"
+  echo "=== Laufende imapsyncctl screen sessions ==="
+  if ! grep -q "imapsyncctl__" <<<"$out"; then
+    echo "Keine imapsyncctl Sessions aktiv."
+    exit 0
+  fi
+  grep "imapsyncctl__" <<<"$out" | sed 's/^[[:space:]]*/- /'
+  echo
+  echo "Attach: screen -r <SESSIONNAME>"
+  echo "Detach: Ctrl+A, dann D"
+}
+
+cmd_new() {
+  ensure_dirs
+  need_cmd imapsync; need_cmd screen; need_cmd tee; need_cmd bash; need_cmd flock
+
+  local name host2 user2 n i host1 user1 sid
+  echo "=== Neues Profil ==="
+  prompt name "Profilname (nur A-Z a-z 0-9 . _ -)" "sync1"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Ungültiger Profilname."
+  [[ -e "$(profile_file "$name")" ]] && die "Profil existiert bereits: $name"
+
+  prompt user2 "Ziel-IMAP Benutzer (user2, E-Mail)" "user2@example.net"
+  prompt_host_or_autodetect host2 "Ziel-IMAP Host (host2)" "$user2"
+
+  mkdir -p "$(profile_dir "$name")" "$(secret_dir "$name")" "$(sources_secret_dir "$name")"
+  chmod 700 "$(secret_dir "$name")" "$(sources_secret_dir "$name")" 2>/dev/null || true
+
+  echo
+  echo "Ziel-Passwort -> $(target_pass_path "$name")"
+  prompt_secret_to_file "$(target_pass_path "$name")" "Ziel-IMAP Passwort"
+
+  echo
+  prompt_int n "Wie viele Quellpostfächer (Konsolidierung)?" "1"
+  [[ "$n" -ge 1 ]] || die "Mindestens 1 Quelle."
+
+  local -a sources_new=()
+  for ((i=1; i<=n; i++)); do
+    echo
+    echo "--- Quelle $i/$n ---"
+    prompt user1 "Quell-IMAP Benutzer (user1, E-Mail)" "user1@example.com"
+    prompt_host_or_autodetect host1 "Quell-IMAP Host (host1)" "$user1"
+    sid="src${i}"
+    sources_new+=( "${sid}|${host1}|${user1}" )
+    echo "Quell-Passwort (${sid}) -> $(source_pass_path "$name" "$sid")"
+    prompt_secret_to_file "$(source_pass_path "$name" "$sid")" "Quell-IMAP Passwort (${sid})"
+  done
+
+  write_profile_file_exact "$name" "$host2" "$user2" "${sources_new[@]}"
+  echo
+  echo "✅ Profil erstellt:"
+  echo "  $(profile_file "$name")"
+
+  if yesno "options.conf Wizard jetzt starten?" "y"; then
+    load_config_for_profile "$name"
+    options_wizard "$name"
+  fi
+}
+
+cmd_addsource() {
+  ensure_dirs
+  need_cmd imapsync
+  local name="${1:-}"; [[ -n "$name" ]] || die "Name fehlt."
+  [[ -f "$(profile_file "$name")" ]] || die "Profil nicht gefunden: $name"
+
+  load_profile "$name"
+  local sid host1 user1
+  sid="$(next_source_id "$name")"
+
+  echo "=== Quelle hinzufügen: $name (ID: $sid) ==="
+  prompt user1 "Quell-IMAP Benutzer (user1, E-Mail)" "user1@example.com"
+  prompt_host_or_autodetect host1 "Quell-IMAP Host (host1)" "$user1"
+
+  mkdir -p "$(sources_secret_dir "$name")"
+  chmod 700 "$(secret_dir "$name")" "$(sources_secret_dir "$name")" 2>/dev/null || true
+
+  local -a sources_new=("${SOURCES[@]}")
+  sources_new+=( "${sid}|${host1}|${user1}" )
+  write_profile_file_exact "$name" "$HOST2" "$USER2" "${sources_new[@]}"
+
+  echo
+  echo "Quell-Passwort (${sid}) -> $(source_pass_path "$name" "$sid")"
+  prompt_secret_to_file "$(source_pass_path "$name" "$sid")" "Quell-IMAP Passwort (${sid})"
+
+  echo "✅ Quelle hinzugefügt."
+}
+
+cmd_reconfigure() {
+  ensure_dirs
+  need_cmd imapsync
+  local name="${1:-}"; [[ -n "$name" ]] || die "Name fehlt."
+  [[ -f "$(profile_file "$name")" ]] || die "Profil nicht gefunden: $name"
+
+  load_profile "$name"
+
+  echo "=== Reconfigure Wizard: $name ==="
+  echo "Hinweis: Passwörter werden NICHT angezeigt (optional neu setzbar)."
+  echo
+
+  local host2_new user2_new
+  prompt user2_new "Ziel-IMAP Benutzer (user2, E-Mail)" "${USER2}"
+  prompt_host_or_autodetect host2_new "Ziel-IMAP Host (host2)" "$user2_new" "${HOST2}"
+
+  echo
+  if [[ -f "$(target_pass_path "$name")" ]]; then
+    if yesno "Ziel-Passwort neu setzen?" "n"; then
+      prompt_secret_to_file "$(target_pass_path "$name")" "Neues Ziel-IMAP Passwort"
+    fi
+  else
+    echo "Ziel-Passwort fehlt -> bitte setzen."
+    prompt_secret_to_file "$(target_pass_path "$name")" "Ziel-IMAP Passwort"
+  fi
+
+  echo
+  echo "Aktuelle Quellen:"
+  local i=0 entry sid shost suser
+  for entry in "${SOURCES[@]}"; do
+    i=$((i+1))
+    IFS='|' read -r sid shost suser <<<"$entry"
+    echo "  ${i}) ${sid}: ${suser} @ ${shost}"
+  done
+  echo
+
+  local -a sources_new=()
+  local -a removed_ids=()
+
+  i=0
+  for entry in "${SOURCES[@]}"; do
+    i=$((i+1))
+    IFS='|' read -r sid shost suser <<<"$entry"
+
+    echo "--- Quelle ${i}/${#SOURCES[@]} (${sid}) ---"
+    echo "Aktuell: ${suser} @ ${shost}"
+
+    if yesno "Diese Quelle entfernen?" "n"; then
+      removed_ids+=( "$sid" )
+      echo "=> Entfernt."
+      echo
+      continue
+    fi
+
+    local shost_new suser_new
+    prompt suser_new "Quell-IMAP Benutzer (E-Mail)" "$suser"
+    prompt_host_or_autodetect shost_new "Quell-IMAP Host" "$suser_new" "$shost"
+
+    sources_new+=( "${sid}|${shost_new}|${suser_new}" )
+
+    local spath; spath="$(source_pass_path "$name" "$sid")"
+    if [[ -f "$spath" ]]; then
+      if yesno "Passwort für ${sid} neu setzen?" "n"; then
+        prompt_secret_to_file "$spath" "Neues Quell-IMAP Passwort (${sid})"
+      fi
+    else
+      echo "Passwort-Datei fehlt für ${sid} -> bitte setzen."
+      prompt_secret_to_file "$spath" "Quell-IMAP Passwort (${sid})"
+    fi
+    echo
+  done
+
+  if [[ "${#removed_ids[@]}" -gt 0 ]]; then
+    echo "Entfernte Quellen: ${removed_ids[*]}"
+    if yesno "Passwort-Dateien der entfernten Quellen löschen?" "y"; then
+      for sid in "${removed_ids[@]}"; do
+        rm -f "$(source_pass_path "$name" "$sid")" 2>/dev/null || true
+      done
+      echo "=> Passfiles entfernt."
+    else
+      echo "=> Passfiles behalten."
+    fi
+    echo
+  fi
+
+  if yesno "Weitere neue Quellen hinzufügen?" "n"; then
+    while true; do
+      local sid_new; sid_new="$(next_source_id "$name")"
+      echo "--- Neue Quelle (${sid_new}) ---"
+      local host1 user1
+      prompt user1 "Quell-IMAP Benutzer (E-Mail)" "user1@example.com"
+      prompt_host_or_autodetect host1 "Quell-IMAP Host" "$user1"
+      sources_new+=( "${sid_new}|${host1}|${user1}" )
+      prompt_secret_to_file "$(source_pass_path "$name" "$sid_new")" "Quell-IMAP Passwort (${sid_new})"
+      if ! yesno "Noch eine weitere Quelle?" "n"; then break; fi
+    done
+  fi
+
+  [[ "${#sources_new[@]}" -ge 1 ]] || die "Es muss mindestens eine Quelle übrig bleiben."
+  write_profile_file_exact "$name" "$host2_new" "$user2_new" "${sources_new[@]}"
+
+  echo "✅ Profil aktualisiert: $(profile_file "$name")"
+
+  if yesno "options.conf Wizard starten/aktualisieren?" "y"; then
+    load_config_for_profile "$name"
+    options_wizard "$name"
+  fi
+}
+
+is_profile_incomplete() {
+  local name="$1"
+  [[ -f "$(profile_file "$name")" ]] || return 0
+  [[ -f "$(target_pass_path "$name")" ]] || return 0
+  ls "$(sources_secret_dir "$name")"/*.pass >/dev/null 2>&1 || return 0
+  return 1
+}
+
+cmd_cleanup() {
+  ensure_dirs
+  local found=0
+  local -a bad=()
+
+  for d in "$PROFILES_ROOT"/*; do
+    [[ -d "$d" ]] || continue
+    [[ -f "$d/profile.conf" ]] || continue
+    local name; name="$(basename "$d")"
+    if is_profile_incomplete "$name"; then
+      bad+=( "$name" )
+      found=1
+    fi
+  done
+
+  [[ "$found" -eq 1 ]] || { echo "✅ Keine unvollständigen Profile gefunden."; exit 0; }
+
+  echo "Unvollständige Profile:"
+  for n in "${bad[@]}"; do echo "  - $n"; done
+  echo
+
+  if ! yesno "Diese Profile löschen (profiles + secrets)?" "n"; then
+    echo "Abgebrochen."
+    exit 0
+  fi
+
+  for n in "${bad[@]}"; do
+    rm -rf "$(profile_dir "$n")" "$(secret_dir "$n")"
+    echo "🗑️  $n gelöscht"
+  done
+}
+
+cmd_delete() {
+  ensure_dirs
+  local name="${1:-}"; [[ -n "$name" ]] || die "Name fehlt."
+
+  echo "⚠️  Profil löschen: $name"
+  echo "  - $(profile_dir "$name")"
+  echo "  - $(secret_dir "$name")"
+  echo "  - $RUNS_DIR/$name (optional)"
+  echo
+
+  local keep_logs="y"
+  if [[ -d "$RUNS_DIR/$name" ]]; then
+    if yesno "Logs behalten?" "y"; then keep_logs="y"; else keep_logs="n"; fi
+  fi
+
+  if ! yesno "Wirklich profiles+secrets löschen?" "n"; then
+    echo "Abgebrochen."
+    exit 0
+  fi
+
+  rm -rf "$(profile_dir "$name")" "$(secret_dir "$name")"
+  echo "profiles+secrets gelöscht."
+
+  if [[ "$keep_logs" == "n" ]]; then
+    rm -rf "$RUNS_DIR/$name"
+    echo "logs gelöscht."
+  else
+    echo "logs behalten."
+  fi
+}
+
+# ============================================================
+# Run logic: lock + build args from config + screen attach + retries
+# ============================================================
+
+run_one_source_sync() {
+  local profile="$1" source_id="$2" host1="$3" user1="$4" host2="$5" user2="$6"
+  local pass1 pass2
+  pass1="$(source_pass_path "$profile" "$source_id")"
+  pass2="$(target_pass_path "$profile")"
+  [[ -f "$pass1" ]] || die "Passwort-Datei fehlt für Quelle ${source_id}: $pass1"
+  [[ -f "$pass2" ]] || die "Ziel-Passwort-Datei fehlt: $pass2"
+
+  local ts src dst rundir logfile screenlog rcfile session
+  ts="$(date +'%Y-%m-%d_%H-%M-%S')"
+  src="$(sanitize "${user1}")@$(sanitize "${host1}")"
+  dst="$(sanitize "${user2}")@$(sanitize "${host2}")"
+
+  rundir="${RUNS_DIR}/${profile}/${ts}__${src}__TO__${dst}"
+  mkdir -p "$rundir"
+
+  logfile="${rundir}/imapsync.log"
+  screenlog="${rundir}/screen.log"
+  rcfile="${rundir}/exitcode"
+
+  session="imapsyncctl__${profile}__${source_id}__${ts}"
+
+  local retries retry_delay
+  retries="$(cfg_get retries 3)"
+  retry_delay="$(cfg_get retry_delay 10)"
+  [[ "$retries" =~ ^[0-9]+$ ]] || retries=3
+  [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=10
+
+  {
+    echo "===== IMAPSYNCCTL START ====="
+    echo "Zeit:     $(date)"
+    echo "Profil:   ${profile}"
+    echo "QuelleID: ${source_id}"
+    echo "Quelle:   ${user1} @ ${host1}"
+    echo "Ziel:     ${user2} @ ${host2}"
+    echo "Retries:  ${retries} (Delay-Basis ${retry_delay}s)"
+    echo "Args:     ${IMAPSYNC_ARGS[*]}"
+    echo "RunDir:   ${rundir}"
+    echo "============================="
+    echo
+  } >> "$logfile"
+
+  echo "----------------------------------------"
+  echo "Profil:    $profile"
+  echo "QuelleID:  $source_id"
+  echo "Quelle:    ${user1} @ ${host1}"
+  echo "Ziel:      ${user2} @ ${host2}"
+  echo "RunDir:    ${rundir}"
+  echo "Session:   ${session}"
+  echo "----------------------------------------"
+  echo "Screen detach: Ctrl+A, dann D"
+  echo
+
+  local attempt=1 rc=1
+  while [[ "$attempt" -le "$retries" ]]; do
+    {
+      echo
+      echo "----- ATTEMPT ${attempt}/${retries} @ $(date) -----"
+    } >> "$logfile"
+
+    screen -S "$session" -L -Logfile "$screenlog" bash -lc "
+      set -o pipefail
+      imapsync \
+        --host1 \"${host1}\" --user1 \"${user1}\" --passfile1 \"${pass1}\" \
+        --host2 \"${host2}\" --user2 \"${user2}\" --passfile2 \"${pass2}\" \
+        ${IMAPSYNC_ARGS[*]} 2>&1 | tee -a \"${logfile}\"
+      echo \$? > \"${rcfile}\"
+    "
+
+    rc="$(cat "$rcfile" 2>/dev/null || echo "1")"
+
+    {
+      echo
+      echo "----- END ATTEMPT ${attempt}/${retries} @ $(date) (rc=${rc}) -----"
+    } >> "$logfile"
+
+    if [[ "$rc" == "0" ]]; then
+      break
+    fi
+
+    if [[ "$attempt" -lt "$retries" ]]; then
+      local delay=$((retry_delay * attempt))
+      echo "imapsync Exit-Code ${rc} (Quelle ${source_id}). Retry in ${delay}s…"
+      sleep "$delay"
+      attempt=$((attempt+1))
+      session="imapsyncctl__${profile}__${source_id}__${ts}__try${attempt}"
+    else
+      attempt=$((attempt+1))
+    fi
+  done
+
+  {
+    echo
+    echo "===== IMAPSYNCCTL ENDE ====="
+    echo "Zeit:     $(date)"
+    echo "Exit:     ${rc}"
+    echo "QuelleID: ${source_id}"
+    echo "RunDir:   ${rundir}"
+    echo "============================"
+  } >> "$logfile"
+
+  echo
+  echo "=== Zusammenfassung (Quelle ${source_id}) ==="
+  echo "Quelle → Ziel:"
+  echo "  ${user1}@${host1}"
+  echo "  → ${user2}@${host2}"
+  echo "Exit-Code: ${rc}"
+  echo "RunDir:    ${rundir}"
+  echo "Logs:"
+  echo "  - ${logfile}"
+  echo "  - ${screenlog}"
+  echo
+  echo "Letzte relevante Zeilen:"
+  (grep -Ei "error|failed|fatal|exception|exiting|return value|summary|stats|copied|messages|folders" "$logfile" | tail -n 15) \
+    || (tail -n 15 "$logfile" || true)
+
+  return "$rc"
+}
+
+cmd_run() {
+  ensure_dirs
+  need_cmd imapsync
+  need_cmd screen
+  need_cmd tee
+  need_cmd bash
+  need_cmd flock
+
+  local name="${1:-}"; [[ -n "$name" ]] || die "Name fehlt."
+  load_profile "$name"
+
+  [[ -f "$(target_pass_path "$name")" ]] || die "Ziel-Passwort-Datei fehlt: $(target_pass_path "$name")"
+  [[ -d "$(sources_secret_dir "$name")" ]] || die "Quellen-Secrets-Verzeichnis fehlt: $(sources_secret_dir "$name")"
+
+  local lf; lf="$(lock_file "$name")"
+  mkdir -p "$STATE_DIR"
+  exec 9>"$lf"
+  flock -n 9 || die "Profil '$name' läuft bereits (Lock: $lf)."
+
+  load_config_for_profile "$name"
+  build_imapsync_args_from_cfg
+
+  echo "=== RUN Profil: $name ==="
+  echo "Ziel: ${USER2} @ ${HOST2}"
+  echo "Quellen: ${#SOURCES[@]}"
+  echo "Args: ${IMAPSYNC_ARGS[*]}"
+  echo
+
+  local overall_rc=0
+  local idx=0 entry sid shost suser
+  for entry in "${SOURCES[@]}"; do
+    idx=$((idx+1))
+    IFS='|' read -r sid shost suser <<<"$entry"
+    [[ -n "${sid:-}" && -n "${shost:-}" && -n "${suser:-}" ]] || die "Profil $name: ungültiger SOURCES Eintrag: $entry"
+
+    echo ">>> (${idx}/${#SOURCES[@]}) Starte Quelle ${sid} …"
+    if ! run_one_source_sync "$name" "$sid" "$shost" "$suser" "$HOST2" "$USER2"; then
+      overall_rc=1
+      echo "!!! Quelle ${sid} endete mit Fehler. Nächste Quelle wird trotzdem gestartet."
+    fi
+  done
+
+  echo
+  echo "=== PROFIL-FINALE ==="
+  if [[ "$overall_rc" -eq 0 ]]; then
+    echo "Alle Quellen abgeschlossen (ohne Fehler)."
+  else
+    echo "Mindestens eine Quelle endete mit Fehler (siehe $RUNS_DIR/$name/)."
+  fi
+  exit "$overall_rc"
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    new)         cmd_new ;;
+    addsource)   cmd_addsource "${1:-}" ;;
+    reconfigure) cmd_reconfigure "${1:-}" ;;
+    run)         cmd_run "${1:-}" ;;
+    status)      cmd_status ;;
+    list)        cmd_list ;;
+    show)        cmd_show "${1:-}" ;;
+    edit)        cmd_edit "${1:-}" ;;
+    delete)      cmd_delete "${1:-}" ;;
+    cleanup)     cmd_cleanup ;;
+    ""|-h|--help) usage ;;
+    *) die "Unbekannter Befehl: $cmd" ;;
+  esac
+}
+
+main "$@"

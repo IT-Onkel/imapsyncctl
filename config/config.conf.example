@@ -1,0 +1,42 @@
+# imapsyncctl global config (key=value)
+# Werte: 1=an, 0=aus, Strings ohne Quotes (außer bei Leerzeichen)
+
+# --- Connection / TLS ---
+ssl1=1
+ssl2=1
+tls1=0
+tls2=0
+sslargs1=
+sslargs2=
+
+# --- Core behavior ---
+usecache=1
+automap=1
+syncinternaldates=1
+
+# Strict sync (löscht Mails im Ziel, die in Quelle nicht existieren)
+delete2=0
+
+# Expunge policy (vorsichtig verwenden!)
+expunge2=0
+uidexpunge2=0
+
+# --- Dedupe / Identification ---
+# Häufig sinnvoll: Message-Id
+useheader=Message-Id
+
+# --- Performance ---
+nofoldersizes=0
+
+# --- Debug (nicht default) ---
+debug=0
+debugimap1=0
+debugimap2=0
+
+# --- imapsyncctl retry logic (nicht imapsync) ---
+retries=3
+retry_delay=10
+
+# --- Extra args (freie imapsync-Argumente) ---
+# Beispiel: extra_args=--useuid --skipsize
+extra_args=
